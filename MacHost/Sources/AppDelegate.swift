@@ -120,10 +120,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Declarative auto-start (no Mac interaction): start the server in the
         // chosen Startup mode if enabled. No blocking permission modal here —
         // it cannot be acted on when the Mac is headless.
+        // A previous run that died (kill, crash) removed its display without the
+        // hook; restore whatever the hook restores.
+        VirtualDisplayManager.runDisplayChangedHook()
+        // `kill`/pkill sends SIGTERM: quit normally so the display is torn down
+        // and the hook runs, instead of vanishing mid-stream.
+        signal(SIGTERM, SIG_IGN)
+        let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termSource.setEventHandler { NSApp.terminate(nil) }
+        termSource.resume()
+        sigtermSource = termSource
+
         if settings.autoStartStreamingOnLaunch {
             settings.connectionMode = settings.startupMode
             Task {
                 await self.checkPermissions()
+                // Launched at login with no tablet plugged in: wait for one
+                // instead of creating an empty display the cursor can get lost on.
+                if self.settings.connectionMode == .usb {
+                    var waited = false
+                    while StatusDetector.usbDevices().isEmpty {
+                        if !waited { debugLog("Auto-start: waiting for a USB device"); waited = true }
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    }
+                }
                 if self.settings.hasScreenRecordingPermission {
                     await self.startServer()
                 } else {
@@ -507,6 +527,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let output = String(data: data, encoding: .utf8) ?? ""
 
                 if process.terminationStatus == 0 {
+                    StatusDetector.markReversed(serial: serial)
                     print("✅ ADB reverse setup successful for \(serial): tcp:\(port) -> tcp:\(port)")
                     return
                 } else {
@@ -955,13 +976,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Touch Entry Point
 
+    private var touchEventCount = 0
+
     func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
+        touchEventCount += 1
+        if touchEventCount <= 3 {
+            debugLog("Touch #\(touchEventCount): action=\(action) at \(x),\(y) enabled=\(settings.touchEnabled) ax=\(AXIsProcessTrusted())")
+        }
         guard settings.touchEnabled else { return }
 
         if !AXIsProcessTrusted() {
             if !accessibilityWarningShown {
                 accessibilityWarningShown = true
-                print("⚠️  Accessibility not granted - touch ignored")
+                debugLog("⚠️  Accessibility not granted - touch ignored")
                 Task { @MainActor in
                     settings.hasAccessibilityPermission = false
                 }
@@ -1312,6 +1339,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         momentumVelocityX = 0
         momentumVelocityY = 0
     }
+
+    private var sigtermSource: DispatchSourceSignal?
 
     func applicationWillTerminate(_ notification: Notification) {
         // Stop momentum scrolling

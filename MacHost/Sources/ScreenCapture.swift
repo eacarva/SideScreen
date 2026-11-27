@@ -441,7 +441,12 @@ class ScreenCapture {
         let (width, height) = encodeSize(for: codec)
 
         encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: frameRate)
+        var encodedCount = 0
         encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
+            encodedCount += 1
+            if encodedCount <= 3 || encodedCount % 300 == 0 {
+                debugLog("Encoded frame #\(encodedCount) (\(data.count) bytes, key=\(isKeyframe), server=\(server != nil))")
+            }
             server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
         }
 

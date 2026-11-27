@@ -13,7 +13,7 @@ cd "$ROOT_DIR/MacHost"
 
 # Kill running instance
 echo "Stopping running Side Screen..."
-pkill -f SideScreen 2>/dev/null || true
+pkill -x SideScreen 2>/dev/null || true
 sleep 0.5
 
 # Clean old build

@@ -103,7 +103,25 @@ class VirtualDisplayManager {
         print("✅ Virtual display created: \(modeDesc) @ \(refreshRate)Hz (ID: \(display.displayID))")
 
         registerScreenParamsObserver()
+        runDisplayChangedHook()
     }
+
+    /// Optional user command run after the virtual display appears or goes away,
+    /// e.g. to restore a BetterDisplay HiDPI mirror that the topology change undid:
+    /// `defaults write com.sidescreen.app SideScreen_displayChangedHook '<shell command>'`
+    /// Runs detached (its own shell, 2 s later) so it still fires when the app is
+    /// quitting: the display disappears on exit and the hook must outlive us.
+    static func runDisplayChangedHook() {
+        guard let command = UserDefaults.standard.string(forKey: "SideScreen_displayChangedHook"),
+              !command.isEmpty else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "(sleep 2; \(command)) >/dev/null 2>&1 &"]
+        try? task.run()
+        debugLog("displayChangedHook scheduled")
+    }
+
+    private func runDisplayChangedHook() { Self.runDisplayChangedHook() }
 
     /// Re-assert the physical-main invariant on every display-topology change:
     /// WindowServer can re-adopt the virtual display as main from a remembered
@@ -376,6 +394,7 @@ class VirtualDisplayManager {
             displayDescriptor = nil
             displaySettings = nil
             print("🗑️  Virtual display destroyed")
+            runDisplayChangedHook()
         }
     }
 

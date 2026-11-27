@@ -2,6 +2,7 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 import os
+import X264Shim
 
 class VideoEncoder {
     private struct Settings: Equatable {
@@ -25,6 +26,9 @@ class VideoEncoder {
     private let sessionQueue = DispatchQueue(label: "VideoEncoder.session", qos: .userInteractive)
 
     private var compressionSession: VTCompressionSession?
+    /// Zero-latency libx264 encoder, used instead of VideoToolbox's software H.264
+    /// encoder when the Mac has no hardware H.264 encoder.
+    private var x264: OpaquePointer?
     var onEncodedFrame: ((Data, UInt64, Bool) -> Void)?  // data, timestamp, isKeyframe
     private var width: Int
     private var height: Int
@@ -83,11 +87,20 @@ class VideoEncoder {
         gamingBoost = settings.gamingBoost
 
         let onlyBitrateChanged = settings.quality == current.quality && settings.gamingBoost == current.gamingBoost
+        if let x264 {
+            x264shim_set_bitrate(x264, Int32(x264BitrateKbps))
+            debugLog("x264 bitrate updated live (\(x264BitrateKbps / 1000)Mbps)")
+            return
+        }
         if onlyBitrateChanged, let session = compressionSession, setAverageBitRate(on: session) == noErr {
             debugLog("VideoToolbox bitrate updated live (\(bitrateMbps)Mbps)")
             return
         }
 
+        if let x264 {
+            x264shim_close(x264)
+            self.x264 = nil
+        }
         // Drain pending frames before invalidation
         if let session = compressionSession {
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
@@ -201,8 +214,50 @@ class VideoEncoder {
 
         VTCompressionSessionPrepareToEncodeFrames(session)
 
+        if codec == .h264, !usesHardwareEncoder(session),
+           let x = x264shim_open(Int32(width), Int32(height), Int32(frameRate), Int32(x264BitrateKbps)) {
+            VTCompressionSessionInvalidate(session)
+            compressionSession = nil
+            x264 = x
+            debugLog("No hardware H.264 encoder — using x264 zerolatency (\(width)x\(height), \(x264BitrateKbps / 1000)Mbps, \(frameRate)fps)")
+            return
+        }
+
         let mode = gamingBoost ? "🎮 GAMING BOOST" : quality.uppercased()
         debugLog("VideoToolbox encoder configured (\(codec == .hevc ? "H.265" : "H.264"), \(bitrateMbps)Mbps, \(frameRate)fps, \(mode))")
+    }
+
+    /// x264 at the panel sizes used here needs far less than the VideoToolbox
+    /// figure, and a huge VBV only adds burst latency.
+    private var x264BitrateKbps: Int { min(bitrateMbps, 30) * 1000 }
+
+    private func usesHardwareEncoder(_ session: VTCompressionSession) -> Bool {
+        var value: CFTypeRef?
+        VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: nil, valueOut: &value)
+        return (value as? Bool) == true
+    }
+
+    private func encodeWithX264(_ x264: OpaquePointer, pixelBuffer: CVPixelBuffer) {
+        let captureNanos = DispatchTime.now().uptimeNanoseconds
+        let forceKeyframe = stateLock.withLock { state -> Bool in
+            defer { state.pendingForceKeyframe = false }
+            return state.pendingForceKeyframe
+        }
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else { return }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let y = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let uv = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else { return }
+        var out: UnsafePointer<UInt8>?
+        var isKey: Int32 = 0
+        let size = x264shim_encode(
+            x264,
+            y.assumingMemoryBound(to: UInt8.self), Int32(CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)),
+            uv.assumingMemoryBound(to: UInt8.self), Int32(CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)),
+            forceKeyframe ? 1 : 0, &out, &isKey)
+        if size < 0 { logEncoderStatus("x264 encode", OSStatus(size)) }
+        guard size > 0, let out else { return }
+        onEncodedFrame?(Data(bytes: out, count: Int(size)), captureNanos, isKey != 0)
     }
 
     /// Force the next encoded frame to be an IDR (sync) frame.
@@ -215,7 +270,7 @@ class VideoEncoder {
     /// Whether a compression session exists (false when VideoToolbox refused
     /// to create one, e.g. no hardware encoder).
     var hasSession: Bool {
-        sessionQueue.sync { compressionSession != nil }
+        sessionQueue.sync { compressionSession != nil || x264 != nil }
     }
 
     /// Callable from any capture queue: the frame is submitted on
@@ -228,6 +283,10 @@ class VideoEncoder {
     }
 
     private func encodeOnSessionQueue(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
+        if let x264 {
+            encodeWithX264(x264, pixelBuffer: pixelBuffer)
+            return
+        }
         guard let session = compressionSession else { return }
 
         let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
@@ -246,7 +305,7 @@ class VideoEncoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
 
-        VTCompressionSessionEncodeFrame(
+        let encodeStatus = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTimeStamp,
@@ -255,9 +314,11 @@ class VideoEncoder {
             sourceFrameRefcon: refconValue,
             infoFlagsOut: nil
         )
+        if encodeStatus != noErr { logEncoderStatus("EncodeFrame", encodeStatus) }
     }
 
     deinit {
+        if let x264 { x264shim_close(x264) }
         if let session = compressionSession {
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
@@ -265,10 +326,20 @@ class VideoEncoder {
     }
 }
 
+// Log the first few encoder failures; they were dropped silently before.
+private var encoderErrorLogCount = 0
+private func logEncoderStatus(_ site: String, _ status: OSStatus) {
+    guard encoderErrorLogCount < 20 else { return }
+    encoderErrorLogCount += 1
+    debugLog("VideoToolbox \(site) failed: \(status)")
+}
+
 // Static start code to avoid repeated allocations
 private let nalStartCode: [UInt8] = [0, 0, 0, 1]
 
-private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, _, sampleBuffer) in
+private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
+    if status != noErr { logEncoderStatus("output callback", status) }
+    if status == noErr && sampleBuffer == nil { logEncoderStatus("output callback (frame dropped, flags \(infoFlags.rawValue))", 0) }
     guard status == noErr,
           let sampleBuffer = sampleBuffer,
           let refcon = outputCallbackRefCon else {
