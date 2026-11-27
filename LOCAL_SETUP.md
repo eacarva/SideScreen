@@ -40,8 +40,11 @@ defaults write com.sidescreen.app SideScreen_connectionMode -string usb
 defaults write com.sidescreen.app SideScreen_bitrate -int 40
 defaults write com.sidescreen.app SideScreen_resolution -string 1680x1050
 defaults write com.sidescreen.app SideScreen_hiDPI -bool false
-defaults write com.sidescreen.app SideScreen_displayChangedHook -string '/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay set -tagID=15 -mirror=on -targetTagID=2'
+defaults write com.sidescreen.app SideScreen_displayChangedHook -string '/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay set -UUID=00000896-0000-066C-020A-35AA00000000 -mirror=on -targetUUID=6F1C073A-0FBF-F94A-18AD-30B31DC7D52C'
 ```
+
+Use display UUIDs, not tagIDs: BetterDisplay renumbered the tagIDs after a
+macOS update (LG went from 2 to 20) and the hook mirrored the wrong screen.
 
 The tablet also has a per-device profile (`devices.profiles`) that overrides
 resolution on connect: change resolution in the app's settings while the
